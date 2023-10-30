@@ -18,15 +18,15 @@ use axum::{
 use hmac::{Hmac, Mac};
 use hyper::StatusCode;
 use lambda_http::{run, Error};
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use once_cell::sync::Lazy;
 
 type HmacSha256 = Hmac<Sha256>;
 
-static SLACK_SIGNING_SECRET: Lazy<String> = Lazy::new(|| {
-    std::env::var("SLACK_SIGNING_SECRET").expect("SLACK_SIGNING_SECRET is not set.")
-});
+const SLACK_SIGNATURE_VERSION: &str = "v0";
+static SLACK_SIGNING_SECRET: Lazy<String> =
+    Lazy::new(|| std::env::var("SLACK_SIGNING_SECRET").expect("SLACK_SIGNING_SECRET is not set."));
 
 async fn validate_slack_signature(
     mut request: Request<lambda_http::Body>,
@@ -41,33 +41,27 @@ async fn validate_slack_signature(
         .to_owned();
     let timestamp_str = timestamp.to_str().unwrap();
 
-    let body = request.body_mut();
-    let body_copy = body.clone();
-    let body_str = String::from_utf8(body_copy.to_vec()).unwrap();
+    let body_str = String::from_utf8(request.body_mut().to_vec()).unwrap();
 
-    let base_string = format!("v0:{}:{}", timestamp_str, body_str);
+    let base_string = format!("{}:{}:{}", SLACK_SIGNATURE_VERSION, timestamp_str, body_str);
     let mut mac = HmacSha256::new_from_slice(SLACK_SIGNING_SECRET.as_bytes())
         .expect("HMAC can take key of any size");
     mac.update(base_string.as_bytes());
-    let result: String = mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+    let generated_signature: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
 
-    // let result = mac.verify_slice(
-    //     request
-    //         .headers()
-    //         .get("X-Slack-Signature")
-    //         .expect("X-Slack-Signature header is missing")
-    //         .to_str()
-    //         .unwrap()
-    //         .as_bytes(),
-    // );
-    let expected_signature = request
-            .headers()
-            .get("X-Slack-Signature")
-            .expect("X-Slack-Signature header is missing")
-            .to_str()
-            .unwrap();
+    let slack_signature = request
+        .headers()
+        .get("X-Slack-Signature")
+        .expect("X-Slack-Signature header is missing")
+        .to_str()
+        .unwrap();
 
-    if format!("v0={}", result) != expected_signature {
+    if format!("{}={}", SLACK_SIGNATURE_VERSION, generated_signature) != slack_signature {
         //log
         tracing::error!("Invalid signature");
         return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
@@ -75,7 +69,6 @@ async fn validate_slack_signature(
 
     //log
     tracing::info!("success");
-    *request.body_mut() = body_copy;
     let response = next.run(request).await;
     response
 }
@@ -93,6 +86,9 @@ async fn post_slack_events(request: Request<lambda_http::Body>) -> Json<Value> {
     let body = request.body();
     let body_str = String::from_utf8(body.to_vec()).unwrap();
     let body_json: Value = serde_json::from_str(&body_str).unwrap();
+
+    // log body
+    tracing::info!(body = ?body_json, "body");
 
     let typ = body_json["type"].as_str().unwrap();
 
