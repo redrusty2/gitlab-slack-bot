@@ -1,3 +1,4 @@
+use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
     debug_handler,
     extract::{FromRequest, State},
@@ -36,6 +37,8 @@ pub struct MergeRequestStatus {
     pub assignee: Option<Assignee>,
     pub source_branch: String,
     pub target_branch: String,
+    pub approvers: Option<Vec<Approver>>,
+    pub id: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -45,7 +48,12 @@ pub struct PipelineStatus {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Assignee {
-    pub name: String
+    pub name: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct Approver {
+    pub username: String,
 }
 
 pub async fn validate_gitlab_token(
@@ -60,7 +68,7 @@ pub async fn validate_gitlab_token(
         .to_owned();
     let received_token_str = received_token.to_str().unwrap();
 
-    if state.gitlab_api_token != received_token_str {
+    if state.gitlab_secret_token != received_token_str {
         tracing::error!("Invalid token");
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -71,8 +79,11 @@ pub async fn validate_gitlab_token(
     response
 }
 
-pub async fn get_gitlab_mr(state: Arc<AppState>, url_params: &GitlabUrlParams) -> MergeRequestStatus {
-    let write_res = state
+pub async fn get_gitlab_mr(
+    state: Arc<AppState>,
+    url_params: &GitlabUrlParams,
+) -> (MergeRequestStatus, Vec<Approver>) {
+    let gl_res = state
         .http_client
         .get(format!(
             "https://gitlab.com/api/v4/projects/{}%2F{}/merge_requests/{}",
@@ -82,28 +93,40 @@ pub async fn get_gitlab_mr(state: Arc<AppState>, url_params: &GitlabUrlParams) -
         .send()
         .await;
 
-    tracing::info!("gitlab response: {:?}", write_res);
+    tracing::info!("gitlab response: {:?}", gl_res);
     // tracing::info!("gitlab response body: {:?}", write_res.text().await);
+    //
 
-    match write_res {
+    match gl_res {
         Ok(res) => {
-            let body = res.text().await.map_err(|e| {
-                tracing::error!("gitlab response error: {:?}", e);
-                e
-            }).unwrap(); 
+            let body = res
+                .text()
+                .await
+                .map_err(|e| {
+                    tracing::error!("gitlab response error: {:?}", e);
+                    e
+                })
+                .unwrap();
             tracing::info!("gitlab response body: {:?}", body);
-            serde_json::from_str(&body).unwrap()
+            let status: MergeRequestStatus = serde_json::from_str(&body).unwrap();
+            let approvers = get_approvers(status.id, State(state.clone()));
+            (status, approvers.await)
         }
         Err(e) => {
             tracing::error!("gitlab response error: {:?}", e);
-            MergeRequestStatus {
-                title: "Error".to_string(),
-                state: "Error".to_string(),
-                draft: false,
-                assignee: None,
-                source_branch: "Error".to_string(),
-                target_branch: "Error".to_string(),
-            }
+            (
+                MergeRequestStatus {
+                    title: "Error".to_string(),
+                    state: "Error".to_string(),
+                    draft: false,
+                    assignee: None,
+                    source_branch: "Error".to_string(),
+                    target_branch: "Error".to_string(),
+                    approvers: None,
+                    id: -1,
+                },
+                vec![],
+            )
         }
     }
     // deserialize merge status from body
@@ -146,4 +169,115 @@ pub fn extract_gitlab_url_params(url_str: &String) -> GitlabUrlParams {
         project: project.to_string(),
         merge_request_id: merge_request_iid.to_string(),
     }
+}
+
+pub async fn handle_event(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    tracing::info!("gitlab event body: {:?}", body);
+
+    let action = body["object_attributes"]["action"].as_str().unwrap();
+
+    if action == "approved" {
+        tracing::info!("Gitlab merge request approved");
+
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "merge_request_id".to_string(),
+            AttributeValue::S(
+                body["object_attributes"]["id"]
+                    .as_i64()
+                    .unwrap()
+                    .to_string(),
+            ),
+        );
+        item.insert(
+            "approver_username".to_string(),
+            AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
+        );
+
+        let put_request = state
+            .db_client
+            .put_item()
+            .table_name("gitlab-merge-requests")
+            .set_item(Some(item));
+
+        let res = put_request.send().await;
+
+        tracing::info!("dynamodb response: {:?}", res);
+
+        return StatusCode::OK.into_response();
+    } else if action == "unapproved" {
+        tracing::info!("unapproved");
+
+        let mut key = std::collections::HashMap::new();
+        key.insert(
+            "merge_request_id".to_string(),
+            AttributeValue::S(
+                body["object_attributes"]["id"]
+                    .as_i64()
+                    .unwrap()
+                    .to_string(),
+            ),
+        );
+        key.insert(
+            "approver_username".to_string(),
+            AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
+        );
+
+        let delete_request = state
+            .db_client
+            .delete_item()
+            .table_name("gitlab-merge-requests")
+            .set_key(Some(key));
+
+        let res = delete_request.send().await;
+
+        tracing::info!("dynamodb response: {:?}", res);
+    }
+
+    StatusCode::BAD_REQUEST.into_response()
+}
+
+pub async fn get_approvers(
+    merge_request_id: i64,
+    State(state): State<Arc<AppState>>,
+) -> Vec<Approver> {
+    let mut key = std::collections::HashMap::new();
+    key.insert(
+        "merge_request_id".to_string(),
+        AttributeValue::S(merge_request_id.to_string()),
+    );
+
+    let query_request = state
+        .db_client
+        .query()
+        .table_name("gitlab-merge-requests")
+        .key_condition_expression("merge_request_id = :merge_request_id")
+        .expression_attribute_values(
+            ":merge_request_id",
+            AttributeValue::S(merge_request_id.to_string()),
+        );
+
+    let res = query_request.send().await;
+
+    tracing::info!("dynamodb response: {:?}", res);
+
+    let items = res.unwrap().items.unwrap();
+
+    let mut approvers = Vec::new();
+
+    for item in items {
+        let approver = Approver {
+            username: item
+                .get("approver_username")
+                .unwrap()
+                .as_s()
+                .as_ref()
+                .unwrap()
+                .to_string(),
+        };
+
+        approvers.push(approver);
+    }
+
+    approvers
 }

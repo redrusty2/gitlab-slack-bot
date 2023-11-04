@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use gitlab_slack_bot::state::AppState;
+use gitlab_slack_bot::{state::AppState, gitlab};
 use hmac::{Hmac, Mac};
 use hyper::{
     header::{AUTHORIZATION, CONTENT_TYPE},
@@ -114,17 +114,18 @@ async fn post_slack_events(
                         .unwrap()
                         .to_string(),
                 );
-                let mr_status = get_gitlab_mr(state.clone(), &url_params).await;
+                let (mr, approvers) = get_gitlab_mr(state.clone(), &url_params).await;
 
                 let body = json!({
                     "channel": body_json["event"]["channel"],
-                    "text": format!("*{}* - {} - {} - {} - {} - {}",
-                        mr_status.title,
-                        mr_status.state,
-                        mr_status.draft,
-                        mr_status.assignee.map(|a| a.name).unwrap_or("None".to_string()),
-                        mr_status.source_branch,
-                        mr_status.target_branch,
+                    "text": format!("*{}* - {} - {} - {} - {} - {} - {}",
+                        mr.title,
+                        mr.state,
+                        mr.draft,
+                        mr.assignee.map(|a| a.name).unwrap_or("None".to_string()),
+                        mr.source_branch,
+                        mr.target_branch,
+                        approvers.iter().map(|a| a.username.clone()).collect::<Vec<String>>().join(", ")
                     ),
                 });
 
@@ -155,16 +156,6 @@ async fn post_slack_events(
     };
 }
 
-async fn post_gitlab_events(
-    State(state): State<Arc<AppState>>,
-    Json(body_json): Json<Value>,
-) -> Json<Value> {
-    // log body
-    tracing::info!(body = ?body_json, "body");
-
-    Json(json!({ "msg": "I am POST /gitlab-events" }))
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // required to enable CloudWatch error logging by the runtime
@@ -192,11 +183,16 @@ async fn main() -> Result<(), Error> {
         HeaderValue::from_str(format!("Bearer {}", GITLAB_API_TOKEN.as_str()).as_str()).unwrap(),
     );
 
+    let shared_config = aws_config::from_env().load().await;
+    let db_client = aws_sdk_dynamodb::Client::new(&shared_config);
+
     let app_state = Arc::new(AppState {
         http_client: Client::new(),
         slack_api_headers,
         gitlab_api_headers,
         gitlab_api_token: GITLAB_API_TOKEN.as_str().to_string(),
+        gitlab_secret_token: GITLAB_SECRET_TOKEN.as_str().to_string(),
+        db_client,
     });
 
     let app = Router::new()
@@ -206,7 +202,7 @@ async fn main() -> Result<(), Error> {
         )
         .route(
             "/gitlab-events",
-            post(post_gitlab_events).route_layer(middleware::from_fn_with_state(app_state.clone(), validate_gitlab_token)),
+            post(gitlab::handle_event).route_layer(middleware::from_fn_with_state(app_state.clone(), validate_gitlab_token)),
         )
         .with_state(app_state)
         .route("/", get(hello));
