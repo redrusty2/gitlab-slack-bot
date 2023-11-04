@@ -397,12 +397,14 @@ dependencies = [
  "lambda_runtime",
  "once_cell",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

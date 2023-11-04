@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use gitlab_slack_bot::state::AppState;
 use hmac::{Hmac, Mac};
 use hyper::{
     header::{AUTHORIZATION, CONTENT_TYPE},
@@ -19,6 +20,8 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::sync::Arc;
 
+use gitlab_slack_bot::gitlab::{extract_gitlab_url_params, get_gitlab_mr, validate_gitlab_token};
+
 type HmacSha256 = Hmac<Sha256>;
 
 const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
@@ -28,13 +31,11 @@ static SLACK_SIGNING_SECRET: Lazy<String> =
 static SLACK_OAUTH_TOKEN: Lazy<String> =
     Lazy::new(|| std::env::var("SLACK_OAUTH_TOKEN").expect("SLACK_OAUTH_TOKEN is not set."));
 
+const GITLAB_DOMAIN: &str = "gitlab.com";
 static GITLAB_SECRET_TOKEN: Lazy<String> =
     Lazy::new(|| std::env::var("GITLAB_SECRET_TOKEN").expect("GITLAB_SECRET_TOKEN is not set."));
-
-struct AppState {
-    http_client: Client,
-    slack_api_headers: HeaderMap,
-}
+static GITLAB_API_TOKEN: Lazy<String> =
+    Lazy::new(|| std::env::var("GITLAB_API_TOKEN").expect("GITLAB_API_TOKEN is not set."));
 
 async fn validate_slack_signature(
     mut request: Request<lambda_http::Body>,
@@ -79,35 +80,12 @@ async fn validate_slack_signature(
     response
 }
 
-async fn validate_gitlab_token(
-    request: Request<lambda_http::Body>,
-    next: Next<lambda_http::Body>,
-) -> Response {
-    let received_token = &request
-        .headers()
-        .get("X-Gitlab-Token")
-        .expect("X-Gitlab-Token header is missing")
-        .to_owned();
-    let received_token_str = received_token.to_str().unwrap();
-
-    if GITLAB_SECRET_TOKEN.as_str() != received_token_str {
-        tracing::error!("Invalid token");
-        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-    }
-
-    //log
-    tracing::info!("Token is valid");
-    let response = next.run(request).await;
-    response
-}
-
 async fn hello() -> String {
     "Hello".to_string()
 }
 
 async fn post_slack_events(
     State(state): State<Arc<AppState>>,
-    // request: Request<lambda_http::Body>,
     Json(body_json): Json<Value>,
 ) -> Response {
     // read body json
@@ -130,9 +108,24 @@ async fn post_slack_events(
             "link_shared" => {
                 tracing::info!("Slack link_shared");
 
+                let url_params = extract_gitlab_url_params(
+                    &body_json["event"]["links"][0]["url"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                let mr_status = get_gitlab_mr(state.clone(), &url_params).await;
+
                 let body = json!({
                     "channel": body_json["event"]["channel"],
-                    "text": "Hello, world!"
+                    "text": format!("*{}* - {} - {} - {} - {} - {}",
+                        mr_status.title,
+                        mr_status.state,
+                        mr_status.draft,
+                        mr_status.assignee.map(|a| a.name).unwrap_or("None".to_string()),
+                        mr_status.source_branch,
+                        mr_status.target_branch,
+                    ),
                 });
 
                 let write_res = state
@@ -162,12 +155,10 @@ async fn post_slack_events(
     };
 }
 
-async fn post_gitlab_events(request: Request<lambda_http::Body>) -> Json<Value> {
-    // read body json
-    let body = request.body();
-    let body_str = String::from_utf8(body.to_vec()).unwrap();
-    let body_json: Value = serde_json::from_str(&body_str).unwrap();
-
+async fn post_gitlab_events(
+    State(state): State<Arc<AppState>>,
+    Json(body_json): Json<Value>,
+) -> Json<Value> {
     // log body
     tracing::info!(body = ?body_json, "body");
 
@@ -195,9 +186,17 @@ async fn main() -> Result<(), Error> {
         HeaderValue::from_str(format!("Bearer {}", SLACK_OAUTH_TOKEN.as_str()).as_str()).unwrap(),
     );
 
+    let mut gitlab_api_headers = HeaderMap::new();
+    gitlab_api_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(format!("Bearer {}", GITLAB_API_TOKEN.as_str()).as_str()).unwrap(),
+    );
+
     let app_state = Arc::new(AppState {
         http_client: Client::new(),
         slack_api_headers,
+        gitlab_api_headers,
+        gitlab_api_token: GITLAB_API_TOKEN.as_str().to_string(),
     });
 
     let app = Router::new()
@@ -207,7 +206,7 @@ async fn main() -> Result<(), Error> {
         )
         .route(
             "/gitlab-events",
-            post(post_gitlab_events).route_layer(middleware::from_fn(validate_gitlab_token)),
+            post(post_gitlab_events).route_layer(middleware::from_fn_with_state(app_state.clone(), validate_gitlab_token)),
         )
         .with_state(app_state)
         .route("/", get(hello));
