@@ -8,5 +8,10 @@ pub struct AppState {
     pub gitlab_api_headers: HeaderMap,
     pub gitlab_api_token: String,
     pub gitlab_secret_token: String,
-    pub db_client: DynamoDbClient
+    pub db_client: DynamoDbClient,
+    pub db_approvers_table_name: String,
+    pub db_slack_messages_table_name: String
 }
+
+
+

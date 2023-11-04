@@ -24,9 +24,8 @@ use url::Url;
 use crate::state::AppState;
 
 pub struct GitlabUrlParams {
-    pub namespace: String,
-    pub project: String,
-    pub merge_request_id: String,
+    pub project_with_namespace: String,
+    pub merge_request_iid: String,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -79,15 +78,16 @@ pub async fn validate_gitlab_token(
     response
 }
 
-pub async fn get_gitlab_mr(
+pub async fn get_gitlab_mr_from_url(
     state: Arc<AppState>,
-    url_params: &GitlabUrlParams,
+    url_params: GitlabUrlParams,
 ) -> (MergeRequestStatus, Vec<Approver>) {
     let gl_res = state
         .http_client
         .get(format!(
-            "https://gitlab.com/api/v4/projects/{}%2F{}/merge_requests/{}",
-            url_params.namespace, url_params.project, url_params.merge_request_id
+            "https://gitlab.com/api/v4/projects/{}/merge_requests/{}",
+            url_params.project_with_namespace.replace("/", "%2F"),
+            url_params.merge_request_iid
         ))
         .headers(state.gitlab_api_headers.clone())
         .send()
@@ -165,76 +165,63 @@ pub fn extract_gitlab_url_params(url_str: &String) -> GitlabUrlParams {
     );
 
     GitlabUrlParams {
-        namespace: namespace.to_string(),
-        project: project.to_string(),
-        merge_request_id: merge_request_iid.to_string(),
+        project_with_namespace: format!("{}%2F{}", namespace, project),
+        merge_request_iid: merge_request_iid.to_string(),
     }
 }
 
-pub async fn handle_event(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    tracing::info!("gitlab event body: {:?}", body);
+pub async fn handle_approved_event(state: Arc<AppState>, body: Value) {
+    let mut item = std::collections::HashMap::new();
+    item.insert(
+        "merge_request_id".to_string(),
+        AttributeValue::S(
+            body["object_attributes"]["id"]
+                .as_i64()
+                .unwrap()
+                .to_string(),
+        ),
+    );
+    item.insert(
+        "approver_username".to_string(),
+        AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
+    );
 
-    let action = body["object_attributes"]["action"].as_str().unwrap();
+    let put_request = state
+        .db_client
+        .put_item()
+        .table_name(state.db_approvers_table_name.clone())
+        .set_item(Some(item));
 
-    if action == "approved" {
-        tracing::info!("Gitlab merge request approved");
+    let res = put_request.send().await;
 
-        let mut item = std::collections::HashMap::new();
-        item.insert(
-            "merge_request_id".to_string(),
-            AttributeValue::S(
-                body["object_attributes"]["id"]
-                    .as_i64()
-                    .unwrap()
-                    .to_string(),
-            ),
-        );
-        item.insert(
-            "approver_username".to_string(),
-            AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
-        );
+    tracing::info!("dynamodb response: {:?}", res);
+}
 
-        let put_request = state
-            .db_client
-            .put_item()
-            .table_name("gitlab-merge-requests")
-            .set_item(Some(item));
+pub async fn handle_unapproved_event(state: Arc<AppState>, body: Value) {
+    let mut key = std::collections::HashMap::new();
+    key.insert(
+        "merge_request_id".to_string(),
+        AttributeValue::S(
+            body["object_attributes"]["id"]
+                .as_i64()
+                .unwrap()
+                .to_string(),
+        ),
+    );
+    key.insert(
+        "approver_username".to_string(),
+        AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
+    );
 
-        let res = put_request.send().await;
+    let delete_request = state
+        .db_client
+        .delete_item()
+        .table_name(state.db_approvers_table_name.clone())
+        .set_key(Some(key));
 
-        tracing::info!("dynamodb response: {:?}", res);
+    let res = delete_request.send().await;
 
-        return StatusCode::OK.into_response();
-    } else if action == "unapproved" {
-        tracing::info!("unapproved");
-
-        let mut key = std::collections::HashMap::new();
-        key.insert(
-            "merge_request_id".to_string(),
-            AttributeValue::S(
-                body["object_attributes"]["id"]
-                    .as_i64()
-                    .unwrap()
-                    .to_string(),
-            ),
-        );
-        key.insert(
-            "approver_username".to_string(),
-            AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
-        );
-
-        let delete_request = state
-            .db_client
-            .delete_item()
-            .table_name("gitlab-merge-requests")
-            .set_key(Some(key));
-
-        let res = delete_request.send().await;
-
-        tracing::info!("dynamodb response: {:?}", res);
-    }
-
-    StatusCode::BAD_REQUEST.into_response()
+    tracing::info!("dynamodb response: {:?}", res);
 }
 
 pub async fn get_approvers(
@@ -250,7 +237,7 @@ pub async fn get_approvers(
     let query_request = state
         .db_client
         .query()
-        .table_name("gitlab-merge-requests")
+        .table_name(state.db_approvers_table_name.clone())
         .key_condition_expression("merge_request_id = :merge_request_id")
         .expression_attribute_values(
             ":merge_request_id",

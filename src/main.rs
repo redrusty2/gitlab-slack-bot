@@ -1,3 +1,4 @@
+use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
     debug_handler,
     extract::{FromRequest, State},
@@ -7,7 +8,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use gitlab_slack_bot::{state::AppState, gitlab};
+use gitlab_slack_bot::{
+    gitlab::{self, GitlabUrlParams},
+    state::AppState,
+};
 use hmac::{Hmac, Mac};
 use hyper::{
     header::{AUTHORIZATION, CONTENT_TYPE},
@@ -20,11 +24,14 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::sync::Arc;
 
-use gitlab_slack_bot::gitlab::{extract_gitlab_url_params, get_gitlab_mr, validate_gitlab_token};
+use gitlab_slack_bot::gitlab::{
+    extract_gitlab_url_params, get_gitlab_mr_from_url, validate_gitlab_token,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+const SLACK_UPDATE_MESSAGE_URL: &str = "https://slack.com/api/chat.update";
 const SLACK_SIGNATURE_VERSION: &str = "v0";
 static SLACK_SIGNING_SECRET: Lazy<String> =
     Lazy::new(|| std::env::var("SLACK_SIGNING_SECRET").expect("SLACK_SIGNING_SECRET is not set."));
@@ -114,7 +121,7 @@ async fn post_slack_events(
                         .unwrap()
                         .to_string(),
                 );
-                let (mr, approvers) = get_gitlab_mr(state.clone(), &url_params).await;
+                let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), url_params).await;
 
                 let body = json!({
                     "channel": body_json["event"]["channel"],
@@ -138,9 +145,32 @@ async fn post_slack_events(
                     .await
                     .unwrap();
 
-                //log
-                tracing::info!("slack response: {:?}", write_res);
-                tracing::info!("slack response body: {:?}", write_res.text().await);
+                // store message ts in db
+                let body: Value = write_res.json().await.unwrap();
+                tracing::info!("slack response body: {:?}", body);
+                let ts = body["ts"].as_str().unwrap();
+                let channel = body_json["event"]["channel"].as_str().unwrap();
+
+                let mut item = std::collections::HashMap::new();
+                item.insert(
+                    "merge_request_id".to_string(),
+                    AttributeValue::S(mr.id.to_string()),
+                );
+                item.insert("message_ts".to_string(), AttributeValue::S(ts.to_string()));
+                item.insert("channel".to_string(), AttributeValue::S(channel.to_string()));
+
+                let put_request = state
+                    .db_client
+                    .put_item()
+                    .table_name(state.db_slack_messages_table_name.clone())
+                    .set_item(Some(item));
+
+                let res = put_request.send().await;
+
+                tracing::info!("dynamodb response: {:?}", res);
+
+                // tracing::info!("slack response: {:?}", write_res);
+                // tracing::info!("slack response body: {:?}", write_res.text().await);
 
                 Json(json!({})).into_response()
             }
@@ -154,6 +184,150 @@ async fn post_slack_events(
             (StatusCode::BAD_REQUEST, "Unknown event type").into_response()
         }
     };
+}
+
+async fn update_slack_messages(
+    state: Arc<AppState>,
+    merge_request_id: i64,
+    merge_request_iid: i64,
+    project_with_namespace: String,
+) {
+    let query_request = state
+        .db_client
+        .query()
+        .table_name(state.db_slack_messages_table_name.clone())
+        .key_condition_expression("merge_request_id = :merge_request_id")
+        .expression_attribute_values(
+            ":merge_request_id".to_string(),
+            AttributeValue::S(merge_request_id.to_string()),
+        );
+
+    // print query before sending
+    tracing::info!("dynamodb query: {:?}", query_request);
+    
+
+    let res = query_request.send().await;
+
+    tracing::info!("dynamodb response: {:?}", res);
+
+    let messages = res
+        .unwrap()
+        .items
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let message_ts = item
+                .get("message_ts")
+                .unwrap()
+                .as_s()
+                .as_ref()
+                .unwrap()
+                .to_string();
+            let channel = item
+                .get("channel")
+                .unwrap()
+                .as_s()
+                .as_ref()
+                .unwrap()
+                .to_string();
+
+            (message_ts, channel)
+        })
+        .collect::<Vec<(String, String)>>();
+
+    if messages.len() == 0 {
+        return;
+    }
+
+    let url_params = GitlabUrlParams {
+        merge_request_iid: merge_request_iid.to_string(),
+        project_with_namespace,
+    };
+
+    let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), url_params).await;
+    let text = format!(
+        "*{}* - {} - {} - {} - {} - {} - {}",
+        mr.title,
+        mr.state,
+        mr.draft,
+        mr.assignee.map(|a| a.name).unwrap_or("None".to_string()),
+        mr.source_branch,
+        mr.target_branch,
+        approvers
+            .iter()
+            .map(|a| a.username.clone())
+            .collect::<Vec<String>>()
+            .join(", ")
+    );
+
+    for message in messages {
+        let body = json!({
+            "channel": message.1,
+            "text": text,
+            "ts": message.0
+        });
+
+        let write_res = state
+            .http_client
+            .post(SLACK_UPDATE_MESSAGE_URL)
+            .headers(state.slack_api_headers.clone())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        let body: Value = write_res.json().await.unwrap();
+        tracing::info!("slack response body: {:?}", body);
+    }
+}
+
+async fn handle_gitlab_event(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    tracing::info!("gitlab event body: {:?}", body);
+
+    let action = body["object_attributes"]["action"].as_str().unwrap();
+    let event_type = body["event_type"].as_str().unwrap();
+    let object_kind = body["object_kind"].as_str().unwrap();
+
+    if event_type != "merge_request" || object_kind != "merge_request" {
+        tracing::info!("Not a merge request event");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let merge_request_iid = body["object_attributes"]["iid"].as_i64().unwrap();
+    let merge_request_id = body["object_attributes"]["id"].as_i64().unwrap();
+    let project_with_namespace = body["project"]["path_with_namespace"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    if action == "approved" {
+        tracing::info!("Gitlab merge request approved");
+        gitlab::handle_approved_event(state.clone(), body).await;
+        update_slack_messages(
+            state.clone(),
+            merge_request_id,
+            merge_request_iid,
+            project_with_namespace,
+        )
+        .await;
+        return StatusCode::OK.into_response();
+    } else if action == "unapproved" {
+        tracing::info!("unapproved");
+        gitlab::handle_unapproved_event(state.clone(), body).await;
+        update_slack_messages(
+            state.clone(),
+            merge_request_id,
+            merge_request_iid,
+            project_with_namespace,
+        )
+        .await;
+        return StatusCode::OK.into_response();
+    }
+
+    StatusCode::BAD_REQUEST.into_response()
 }
 
 #[tokio::main]
@@ -193,6 +367,8 @@ async fn main() -> Result<(), Error> {
         gitlab_api_token: GITLAB_API_TOKEN.as_str().to_string(),
         gitlab_secret_token: GITLAB_SECRET_TOKEN.as_str().to_string(),
         db_client,
+        db_approvers_table_name: "gitlab-merge-request-approvers".to_string(),
+        db_slack_messages_table_name: "gitlab-merge-request-slack-messages".to_string(),
     });
 
     let app = Router::new()
@@ -202,7 +378,10 @@ async fn main() -> Result<(), Error> {
         )
         .route(
             "/gitlab-events",
-            post(gitlab::handle_event).route_layer(middleware::from_fn_with_state(app_state.clone(), validate_gitlab_token)),
+            post(handle_gitlab_event).route_layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                validate_gitlab_token,
+            )),
         )
         .with_state(app_state)
         .route("/", get(hello));
