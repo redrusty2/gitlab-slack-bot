@@ -31,6 +31,7 @@ use gitlab_slack_bot::gitlab::{
 type HmacSha256 = Hmac<Sha256>;
 
 const SLACK_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+const SLACK_DELETE_MESSAGE_URL: &str = "https://slack.com/api/chat.delete";
 const SLACK_UPDATE_MESSAGE_URL: &str = "https://slack.com/api/chat.update";
 const SLACK_SIGNATURE_VERSION: &str = "v0";
 static SLACK_SIGNING_SECRET: Lazy<String> =
@@ -131,9 +132,6 @@ async fn post_slack_events(
                 let body = json!({
                     "channel": body_json["event"]["channel"],
                     "blocks": blocks,
-                    "metadata": {
-                        "from_merge_request_bot": true
-                    }
                 });
 
                 let write_res = state
@@ -151,6 +149,42 @@ async fn post_slack_events(
                 tracing::info!("slack response body: {:?}", body);
                 let ts = body["ts"].as_str().unwrap();
                 let channel = body_json["event"]["channel"].as_str().unwrap();
+
+                let query_request = state
+                    .db_client
+                    .query()
+                    .table_name(state.db_slack_messages_table_name.clone())
+                    .key_condition_expression("merge_request_id = :merge_request_id")
+                    .expression_attribute_values(
+                        ":merge_request_id".to_string(),
+                        AttributeValue::S(mr.id.to_string()),
+                    );
+
+                tracing::info!("dynamodb query: {:?}", query_request);
+
+                let query_res = query_request.send().await;
+
+                // delete old slack message
+                let items = query_res.unwrap().items.unwrap();
+                if items.len() > 0 {
+                    let body = json!({
+                        "channel": body_json["event"]["channel"],
+                        "ts": items[0]["message_ts"].as_s().unwrap(),
+                    });
+
+                    let delete_res = state
+                        .http_client
+                        .post(SLACK_DELETE_MESSAGE_URL)
+                        .headers(state.slack_api_headers.clone())
+                        .json(&body)
+                        .send()
+                        .await
+                        .unwrap();
+
+                    let body: Value = delete_res.json().await.unwrap();
+
+                    tracing::info!("slack delete response body: {:?}", body);
+                }
 
                 let mut item = std::collections::HashMap::new();
                 item.insert(
@@ -173,19 +207,16 @@ async fn post_slack_events(
 
                 tracing::info!("dynamodb response: {:?}", res);
 
-                // tracing::info!("slack response: {:?}", write_res);
-                // tracing::info!("slack response body: {:?}", write_res.text().await);
-
                 Json(json!({})).into_response()
             }
             _event_type => {
                 tracing::info!("Unknown event_callback type: {}", _event_type);
-                (StatusCode::BAD_REQUEST, "Unknown event_callback type").into_response()
+                (StatusCode::OK, "Unknown event_callback type").into_response()
             }
         },
         _event_type => {
             tracing::info!("Unknown event type: {}", _event_type);
-            (StatusCode::BAD_REQUEST, "Unknown event type").into_response()
+            (StatusCode::OK, "Unknown event type").into_response()
         }
     };
 }
@@ -206,7 +237,6 @@ async fn update_slack_messages(
             AttributeValue::S(merge_request_id.to_string()),
         );
 
-    // print query before sending
     tracing::info!("dynamodb query: {:?}", query_request);
 
     let res = query_request.send().await;
@@ -310,14 +340,10 @@ async fn handle_gitlab_event(
         "merge",
     ];
 
-    let relevant_changes = vec![
-        "title",
-        "assignee_id",
-        "assignee_ids",
-    ];
+    let relevant_changes = vec!["title", "assignee_id", "assignee_ids"];
 
     if relevant_actions.contains(&action) && !relevant_changes.contains(&action) {
-        tracing::info!("Gitlab merge request action: {}" , action);
+        tracing::info!("Gitlab merge request action: {}", action);
         update_slack_messages(
             state.clone(),
             merge_request_id,

@@ -263,62 +263,6 @@ pub async fn get_approvers(
 
     approvers
 }
-//
-// pub fn create_status_message(merge_status: &MergeStatus, approvers: &Vec<Approver>) -> String {
-//     let status = match merge_status.state.as_str() {
-//         "opened" => (":large_green_circle:", "Open"),
-//         "closed" => (":large_red_circle:", "Closed"),
-//         "merged" => (":large_blue_circle:", "Merged"),
-//         _ => ("", "Unknown"),
-//     };
-//
-//     let approved_element = if approvers.len() > 0 {
-//         format!(
-//             r##"{{
-//             "type": "mrkdwn",
-//             "text": ":white_check_mark: *Approved:* {}"
-//         }}"##,
-//             approvers
-//                 .iter()
-//                 .map(|a| a.username.clone())
-//                 .collect::<Vec<String>>()
-//                 .join(", ")
-//         )
-//     } else {
-//         "".to_string()
-//     };
-//
-//     format!(
-//         r##"{{
-//             "blocks": [
-//                 {{
-//                     "type": "context",
-//                     "elements": [
-//                         {{
-//                             "type": "mrkdwn",
-//                             "text": "{} {}"
-//                         }},
-//                         {{
-//                             "type": "mrkdwn",
-//                             "text": "<{}|{}>"
-//                         }},
-//                         {{
-//                             "type": "mrkdwn",
-//                             "text": "*Assignee:* {}"
-//                         }},
-//                         {}
-//                     ]
-//                 }}
-//             ]
-//         }}"##,
-//         status.0,
-//         status.1,
-//         merge_status.web_url,
-//         merge_status.title,
-//         merge_status.assignee.as_ref().unwrap().name,
-//         approved_element
-//     )
-// }
 
 #[derive(Serialize, Deserialize)]
 struct MarkdownElement {
