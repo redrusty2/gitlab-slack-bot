@@ -61,6 +61,7 @@ pub struct Assignee {
 #[derive(Deserialize, Debug)]
 pub struct Approver {
     pub username: String,
+    pub name: String
 }
 
 pub async fn validate_gitlab_token(
@@ -225,6 +226,10 @@ pub async fn handle_approved_event(state: Arc<AppState>, body: &Value) {
         "approver_username".to_string(),
         AttributeValue::S(body["user"]["username"].as_str().unwrap().to_string()),
     );
+    item.insert(
+        "approver_name".to_string(),
+        AttributeValue::S(body["user"]["name"].as_str().unwrap().to_string()),
+    );
 
     let put_request = state
         .db_client
@@ -296,6 +301,13 @@ pub async fn get_approvers(
         let approver = Approver {
             username: item
                 .get("approver_username")
+                .unwrap()
+                .as_s()
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            name: item   
+                .get("approver_name")
                 .unwrap()
                 .as_s()
                 .as_ref()
@@ -408,7 +420,7 @@ pub fn create_status_message_text(
             "   _*Approvals:*_ {}",
             approvers
                 .iter()
-                .map(|a| a.username.clone())
+                .map(|a| a.name.clone())
                 .collect::<Vec<String>>()
                 .join(", "),
         )
