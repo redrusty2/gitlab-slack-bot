@@ -339,7 +339,13 @@ pub fn create_status_message(
     approvers: &Vec<Approver>,
 ) -> Vec<ContextBlock> {
     let status = match merge_status.state.as_str() {
-        "opened" => (":large_green_circle:", "Open"),
+        "opened" => {
+            if merge_status.draft {
+                (":white_circle:", "Draft")
+            } else {
+                (":large_green_circle:", "Open")
+            }
+        }
         "closed" => (":red_circle:", "Closed"),
         "merged" => (":large_blue_circle:", "Merged"),
         _ => ("", "Unknown"),
