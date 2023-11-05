@@ -132,6 +132,7 @@ async fn post_slack_events(
                 let body = json!({
                     "channel": body_json["event"]["channel"],
                     "blocks": blocks,
+                    "unfurl_links": false,
                 });
 
                 let write_res = state
