@@ -147,6 +147,11 @@ async fn post_slack_events(
                 // store message ts in db
                 let body: Value = write_res.json().await.unwrap();
                 tracing::info!("slack response body: {:?}", body);
+
+                if body["ok"].as_bool().unwrap() == false {
+                    return Json(json!({})).into_response();
+                }
+
                 let ts = body["ts"].as_str().unwrap();
                 let channel = body_json["event"]["channel"].as_str().unwrap();
 
