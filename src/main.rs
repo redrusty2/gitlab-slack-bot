@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use gitlab_slack_bot::{
-    gitlab::{self, GitlabUrlParams},
+    gitlab::{self, create_status_message, GitlabUrlParams},
     state::AppState,
 };
 use hmac::{Hmac, Mac};
@@ -115,25 +115,27 @@ async fn post_slack_events(
             "link_shared" => {
                 tracing::info!("Slack link_shared");
 
+                let link = body_json["event"]["links"][0]["url"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+                //if the end of the link is #posted_by_bot, ignore it
+                if link.ends_with("#posted_by_bot") {
+                    return Json(json!({})).into_response();
+                }
+
                 let url_params = extract_gitlab_url_params(
-                    &body_json["event"]["links"][0]["url"]
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
+                    &link,
                 );
                 let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), url_params).await;
-
+                let blocks = create_status_message(&mr, &approvers);
                 let body = json!({
                     "channel": body_json["event"]["channel"],
-                    "text": format!("*{}* - {} - {} - {} - {} - {} - {}",
-                        mr.title,
-                        mr.state,
-                        mr.draft,
-                        mr.assignee.map(|a| a.name).unwrap_or("None".to_string()),
-                        mr.source_branch,
-                        mr.target_branch,
-                        approvers.iter().map(|a| a.username.clone()).collect::<Vec<String>>().join(", ")
-                    ),
+                    "blocks": blocks,
+                    "metadata": {
+                        "from_merge_request_bot": true
+                    }
                 });
 
                 let write_res = state
@@ -145,6 +147,7 @@ async fn post_slack_events(
                     .await
                     .unwrap();
 
+                // TODO only have one message exist per merge request, delete old ones
                 // store message ts in db
                 let body: Value = write_res.json().await.unwrap();
                 tracing::info!("slack response body: {:?}", body);
@@ -157,7 +160,10 @@ async fn post_slack_events(
                     AttributeValue::S(mr.id.to_string()),
                 );
                 item.insert("message_ts".to_string(), AttributeValue::S(ts.to_string()));
-                item.insert("channel".to_string(), AttributeValue::S(channel.to_string()));
+                item.insert(
+                    "channel".to_string(),
+                    AttributeValue::S(channel.to_string()),
+                );
 
                 let put_request = state
                     .db_client
@@ -204,7 +210,6 @@ async fn update_slack_messages(
 
     // print query before sending
     tracing::info!("dynamodb query: {:?}", query_request);
-    
 
     let res = query_request.send().await;
 
@@ -245,25 +250,11 @@ async fn update_slack_messages(
     };
 
     let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), url_params).await;
-    let text = format!(
-        "*{}* - {} - {} - {} - {} - {} - {}",
-        mr.title,
-        mr.state,
-        mr.draft,
-        mr.assignee.map(|a| a.name).unwrap_or("None".to_string()),
-        mr.source_branch,
-        mr.target_branch,
-        approvers
-            .iter()
-            .map(|a| a.username.clone())
-            .collect::<Vec<String>>()
-            .join(", ")
-    );
-
+    let blocks = create_status_message(&mr, &approvers);
     for message in messages {
         let body = json!({
             "channel": message.1,
-            "text": text,
+            "blocks": blocks,
             "ts": message.0
         });
 

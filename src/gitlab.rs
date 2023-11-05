@@ -16,6 +16,7 @@ use hyper::{
 use lambda_http::{run, Error};
 use once_cell::sync::Lazy;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::sync::Arc;
@@ -28,29 +29,30 @@ pub struct GitlabUrlParams {
     pub merge_request_iid: String,
 }
 
-#[derive(serde::Deserialize, Debug)]
-pub struct MergeRequestStatus {
+#[derive(Deserialize, Debug)]
+pub struct MergeStatus {
     pub title: String,
     pub state: String,
     pub draft: bool,
     pub assignee: Option<Assignee>,
     pub source_branch: String,
     pub target_branch: String,
-    pub approvers: Option<Vec<Approver>>,
     pub id: i64,
+    pub iid: i64,
+    pub web_url: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 pub struct PipelineStatus {
     pub status: String,
 }
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub struct Assignee {
     pub name: String,
 }
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub struct Approver {
     pub username: String,
 }
@@ -81,7 +83,7 @@ pub async fn validate_gitlab_token(
 pub async fn get_gitlab_mr_from_url(
     state: Arc<AppState>,
     url_params: GitlabUrlParams,
-) -> (MergeRequestStatus, Vec<Approver>) {
+) -> (MergeStatus, Vec<Approver>) {
     let gl_res = state
         .http_client
         .get(format!(
@@ -94,8 +96,6 @@ pub async fn get_gitlab_mr_from_url(
         .await;
 
     tracing::info!("gitlab response: {:?}", gl_res);
-    // tracing::info!("gitlab response body: {:?}", write_res.text().await);
-    //
 
     match gl_res {
         Ok(res) => {
@@ -108,32 +108,28 @@ pub async fn get_gitlab_mr_from_url(
                 })
                 .unwrap();
             tracing::info!("gitlab response body: {:?}", body);
-            let status: MergeRequestStatus = serde_json::from_str(&body).unwrap();
+            let status: MergeStatus = serde_json::from_str(&body).unwrap();
             let approvers = get_approvers(status.id, State(state.clone()));
             (status, approvers.await)
         }
         Err(e) => {
             tracing::error!("gitlab response error: {:?}", e);
             (
-                MergeRequestStatus {
+                MergeStatus {
                     title: "Error".to_string(),
                     state: "Error".to_string(),
                     draft: false,
                     assignee: None,
                     source_branch: "Error".to_string(),
                     target_branch: "Error".to_string(),
-                    approvers: None,
                     id: -1,
+                    iid: -1,
+                    web_url: "Error".to_string(),
                 },
                 vec![],
             )
         }
     }
-    // deserialize merge status from body
-    // let body = write_res.json().await.unwrap();
-    //
-    // tracing::info!("gitlab response body: {:?}", body);
-    // body
 }
 
 pub fn extract_gitlab_url_params(url_str: &String) -> GitlabUrlParams {
@@ -156,7 +152,6 @@ pub fn extract_gitlab_url_params(url_str: &String) -> GitlabUrlParams {
 
     let merge_request_iid = path_segments.next().unwrap_or("");
 
-    //log
     tracing::info!(
         "namespace: {}, project: {}, merge_request_iid: {}",
         namespace,
@@ -267,4 +262,127 @@ pub async fn get_approvers(
     }
 
     approvers
+}
+//
+// pub fn create_status_message(merge_status: &MergeStatus, approvers: &Vec<Approver>) -> String {
+//     let status = match merge_status.state.as_str() {
+//         "opened" => (":large_green_circle:", "Open"),
+//         "closed" => (":large_red_circle:", "Closed"),
+//         "merged" => (":large_blue_circle:", "Merged"),
+//         _ => ("", "Unknown"),
+//     };
+//
+//     let approved_element = if approvers.len() > 0 {
+//         format!(
+//             r##"{{
+//             "type": "mrkdwn",
+//             "text": ":white_check_mark: *Approved:* {}"
+//         }}"##,
+//             approvers
+//                 .iter()
+//                 .map(|a| a.username.clone())
+//                 .collect::<Vec<String>>()
+//                 .join(", ")
+//         )
+//     } else {
+//         "".to_string()
+//     };
+//
+//     format!(
+//         r##"{{
+//             "blocks": [
+//                 {{
+//                     "type": "context",
+//                     "elements": [
+//                         {{
+//                             "type": "mrkdwn",
+//                             "text": "{} {}"
+//                         }},
+//                         {{
+//                             "type": "mrkdwn",
+//                             "text": "<{}|{}>"
+//                         }},
+//                         {{
+//                             "type": "mrkdwn",
+//                             "text": "*Assignee:* {}"
+//                         }},
+//                         {}
+//                     ]
+//                 }}
+//             ]
+//         }}"##,
+//         status.0,
+//         status.1,
+//         merge_status.web_url,
+//         merge_status.title,
+//         merge_status.assignee.as_ref().unwrap().name,
+//         approved_element
+//     )
+// }
+
+#[derive(Serialize, Deserialize)]
+struct MarkdownElement {
+    #[serde(rename = "type")]
+    element_type: String,
+    text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ContextBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    elements: Vec<MarkdownElement>,
+}
+
+pub fn create_status_message(
+    merge_status: &MergeStatus,
+    approvers: &Vec<Approver>,
+) -> Vec<ContextBlock> {
+    let status = match merge_status.state.as_str() {
+        "opened" => (":large_green_circle:", "Open"),
+        "closed" => (":red_circle:", "Closed"),
+        "merged" => (":large_blue_circle:", "Merged"),
+        _ => ("", "Unknown"),
+    };
+
+    let approved_element = if approvers.is_empty() {
+        "".to_string()
+    } else {
+        format!(
+            "   _*Approved:*_ {}  :white_check_mark:",
+            approvers
+                .iter()
+                .map(|a| a.username.clone())
+                .collect::<Vec<String>>()
+                .join(", ")
+        )
+    };
+
+    let strikethrough = if merge_status.state != "opened" {
+        "~"
+    } else {
+        ""
+    };
+
+    let context_block = ContextBlock {
+        block_type: "context".to_string(),
+        elements: vec![MarkdownElement {
+            element_type: "mrkdwn".to_string(),
+            text: format!(
+                "{}{} _{}_   <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}{}",
+                strikethrough,
+                status.0,
+                status.1,
+                merge_status.web_url,
+                merge_status.title,
+                merge_status.assignee.as_ref().unwrap().name,
+                approved_element,
+                strikethrough
+            ),
+        }],
+    };
+
+    let blocks = vec![context_block];
+
+    blocks
 }
