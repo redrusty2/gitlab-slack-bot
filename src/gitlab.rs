@@ -323,7 +323,7 @@ pub struct ContextBlock {
     elements: Vec<MarkdownElement>,
 }
 
-pub fn create_status_message(
+pub fn create_status_message_blocks(
     merge_status: &MergeStatus,
     approvers: &Vec<Approver>,
     project: &Project,
@@ -341,31 +341,18 @@ pub fn create_status_message(
         _ => ("", "Unknown"),
     };
 
-    let approved_element = if approvers.is_empty() {
-        "".to_string()
-    } else {
-        format!(
-            "   _*Approved:*_ {}  :white_check_mark:",
-            approvers
-                .iter()
-                .map(|a| a.username.clone())
-                .collect::<Vec<String>>()
-                .join(", ")
-        )
-    };
-
     let strikethrough = if merge_status.state != "opened" {
         "~"
     } else {
         ""
     };
 
-    let context_block = ContextBlock {
+    let mut context_block = ContextBlock {
         block_type: "context".to_string(),
         elements: vec![MarkdownElement {
             element_type: "mrkdwn".to_string(),
             text: format!(
-                "{}{} _{}_   <{}#posted_by_bot|{}> | <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}{}",
+                "{}{} _{}_   <{}#posted_by_bot|{}> | <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}",
                 strikethrough,
                 status.0,
                 status.1,
@@ -374,13 +361,83 @@ pub fn create_status_message(
                 merge_status.web_url,
                 merge_status.title,
                 merge_status.assignee.as_ref().unwrap().name,
-                approved_element,
                 strikethrough
             ),
         }],
     };
 
-    let blocks = vec![context_block];
+    if !approvers.is_empty() {
+        context_block.elements.push(MarkdownElement {
+            element_type: "mrkdwn".to_string(),
+            text: format!(
+                "{}:white_check_mark: _*Approved:*_ {}{}",
+                strikethrough,
+                approvers
+                    .iter()
+                    .map(|a| a.username.clone())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                strikethrough
+            ),
+        })
+    };
 
-    blocks
+    vec![context_block]
+}
+
+pub fn create_status_message_text(
+    merge_status: &MergeStatus,
+    approvers: &Vec<Approver>,
+    project: &Project,
+) -> String {
+    let status = match merge_status.state.as_str() {
+        "opened" => {
+            if merge_status.draft {
+                (":white_circle:", "Draft")
+            } else {
+                (":large_green_circle:", "Open")
+            }
+        }
+        "closed" => (":red_circle:", "Closed"),
+        "merged" => (":large_blue_circle:", "Merged"),
+        _ => ("", "Unknown"),
+    };
+
+    let approvers_part = if !approvers.is_empty() {
+        format!(
+            "   _*Approvals:*_ {}",
+            approvers
+                .iter()
+                .map(|a| a.username.clone())
+                .collect::<Vec<String>>()
+                .join(", "),
+        )
+    } else {
+        "".to_string()
+    };
+
+    let approved_part = if !approvers.is_empty() {
+            ":white_check_mark: _*Approved*_   ".to_string()
+    } else {
+        "".to_string()
+    };
+
+    let mut text = format!(
+        "{}{} _{}_   <{}#posted_by_bot|{}> | <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}",
+        approved_part,
+        status.0,
+        status.1,
+        project.web_url,
+        project.name,
+        merge_status.web_url,
+        merge_status.title,
+        merge_status.assignee.as_ref().unwrap().name,
+        approvers_part,
+    );
+
+    if merge_status.state != "opened" {
+        text = format!("~{}~", text);
+    };
+
+    text 
 }

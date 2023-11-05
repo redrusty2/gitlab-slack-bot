@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use gitlab_slack_bot::{
-    gitlab::{self, create_status_message, GitlabUrlParams, get_gitlab_project_from_url},
+    gitlab::{self, create_status_message_text, get_gitlab_project_from_url, GitlabUrlParams},
     state::AppState,
 };
 use hmac::{Hmac, Mac};
@@ -128,11 +128,11 @@ async fn post_slack_events(
 
                 let url_params = extract_gitlab_url_params(&link);
                 let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), &url_params).await;
-                let project = get_gitlab_project_from_url(state.clone(), &url_params).await; 
-                let blocks = create_status_message(&mr, &approvers, &project);
+                let project = get_gitlab_project_from_url(state.clone(), &url_params).await;
+                let blocks = create_status_message_text(&mr, &approvers, &project);
                 let body = json!({
                     "channel": body_json["event"]["channel"],
-                    "blocks": blocks,
+                    "text": blocks,
                     "unfurl_links": false,
                 });
 
@@ -286,11 +286,11 @@ async fn update_slack_messages(
 
     let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), &url_params).await;
     let project = get_gitlab_project_from_url(state.clone(), &url_params).await;
-    let blocks = create_status_message(&mr, &approvers, &project);
+    let blocks = create_status_message_text(&mr, &approvers, &project);
     for message in messages {
         let body = json!({
             "channel": message.1,
-            "blocks": blocks,
+            "text": blocks,
             "ts": message.0
         });
 
