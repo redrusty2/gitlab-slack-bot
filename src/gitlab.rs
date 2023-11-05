@@ -165,7 +165,7 @@ pub fn extract_gitlab_url_params(url_str: &String) -> GitlabUrlParams {
     }
 }
 
-pub async fn handle_approved_event(state: Arc<AppState>, body: Value) {
+pub async fn handle_approved_event(state: Arc<AppState>, body: &Value) {
     let mut item = std::collections::HashMap::new();
     item.insert(
         "merge_request_id".to_string(),
@@ -192,7 +192,7 @@ pub async fn handle_approved_event(state: Arc<AppState>, body: Value) {
     tracing::info!("dynamodb response: {:?}", res);
 }
 
-pub async fn handle_unapproved_event(state: Arc<AppState>, body: Value) {
+pub async fn handle_unapproved_event(state: Arc<AppState>, body: &Value) {
     let mut key = std::collections::HashMap::new();
     key.insert(
         "merge_request_id".to_string(),

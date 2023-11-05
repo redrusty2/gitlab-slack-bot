@@ -125,9 +125,7 @@ async fn post_slack_events(
                     return Json(json!({})).into_response();
                 }
 
-                let url_params = extract_gitlab_url_params(
-                    &link,
-                );
+                let url_params = extract_gitlab_url_params(&link);
                 let (mr, approvers) = get_gitlab_mr_from_url(state.clone(), url_params).await;
                 let blocks = create_status_message(&mr, &approvers);
                 let body = json!({
@@ -278,14 +276,15 @@ async fn handle_gitlab_event(
 ) -> Response {
     tracing::info!("gitlab event body: {:?}", body);
 
-    let action = body["object_attributes"]["action"].as_str().unwrap();
     let event_type = body["event_type"].as_str().unwrap();
     let object_kind = body["object_kind"].as_str().unwrap();
 
     if event_type != "merge_request" || object_kind != "merge_request" {
         tracing::info!("Not a merge request event");
-        return StatusCode::BAD_REQUEST.into_response();
+        return StatusCode::OK.into_response();
     }
+
+    let action = body["object_attributes"]["action"].as_str().unwrap();
 
     let merge_request_iid = body["object_attributes"]["iid"].as_i64().unwrap();
     let merge_request_id = body["object_attributes"]["id"].as_i64().unwrap();
@@ -296,18 +295,29 @@ async fn handle_gitlab_event(
 
     if action == "approved" {
         tracing::info!("Gitlab merge request approved");
-        gitlab::handle_approved_event(state.clone(), body).await;
-        update_slack_messages(
-            state.clone(),
-            merge_request_id,
-            merge_request_iid,
-            project_with_namespace,
-        )
-        .await;
-        return StatusCode::OK.into_response();
+        gitlab::handle_approved_event(state.clone(), &body).await;
     } else if action == "unapproved" {
         tracing::info!("unapproved");
-        gitlab::handle_unapproved_event(state.clone(), body).await;
+        gitlab::handle_unapproved_event(state.clone(), &body).await;
+    }
+
+    let relevant_actions = vec![
+        "approved",
+        "unapproved",
+        "update",
+        "reopen",
+        "close",
+        "merge",
+    ];
+
+    let relevant_changes = vec![
+        "title",
+        "assignee_id",
+        "assignee_ids",
+    ];
+
+    if relevant_actions.contains(&action) && !relevant_changes.contains(&action) {
+        tracing::info!("Gitlab merge request action: {}" , action);
         update_slack_messages(
             state.clone(),
             merge_request_id,
@@ -315,10 +325,9 @@ async fn handle_gitlab_event(
             project_with_namespace,
         )
         .await;
-        return StatusCode::OK.into_response();
     }
 
-    StatusCode::BAD_REQUEST.into_response()
+    StatusCode::OK.into_response()
 }
 
 #[tokio::main]
