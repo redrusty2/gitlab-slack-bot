@@ -30,6 +30,12 @@ pub struct GitlabUrlParams {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct Project {
+    pub name: String,
+    pub web_url: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct MergeStatus {
     pub title: String,
     pub state: String,
@@ -82,7 +88,7 @@ pub async fn validate_gitlab_token(
 
 pub async fn get_gitlab_mr_from_url(
     state: Arc<AppState>,
-    url_params: GitlabUrlParams,
+    url_params: &GitlabUrlParams,
 ) -> (MergeStatus, Vec<Approver>) {
     let gl_res = state
         .http_client
@@ -128,6 +134,45 @@ pub async fn get_gitlab_mr_from_url(
                 },
                 vec![],
             )
+        }
+    }
+}
+
+pub async fn get_gitlab_project_from_url(
+    state: Arc<AppState>,
+    url_params: &GitlabUrlParams,
+) -> Project {
+    let gl_res = state
+        .http_client
+        .get(format!(
+            "https://gitlab.com/api/v4/projects/{}",
+            url_params.project_with_namespace.replace("/", "%2F"),
+        ))
+        .headers(state.gitlab_api_headers.clone())
+        .send()
+        .await;
+
+    tracing::info!("gitlab response: {:?}", gl_res);
+
+    match gl_res {
+        Ok(res) => {
+            let body = res
+                .text()
+                .await
+                .map_err(|e| {
+                    tracing::error!("gitlab response error: {:?}", e);
+                    e
+                })
+                .unwrap();
+            tracing::info!("gitlab response body: {:?}", body);
+            serde_json::from_str(&body).unwrap()
+        }
+        Err(e) => {
+            tracing::error!("gitlab response error: {:?}", e);
+            Project {
+                name: "Error".to_string(),
+                web_url: "Error".to_string(),
+            }
         }
     }
 }
@@ -281,6 +326,7 @@ pub struct ContextBlock {
 pub fn create_status_message(
     merge_status: &MergeStatus,
     approvers: &Vec<Approver>,
+    project: &Project,
 ) -> Vec<ContextBlock> {
     let status = match merge_status.state.as_str() {
         "opened" => {
@@ -319,10 +365,12 @@ pub fn create_status_message(
         elements: vec![MarkdownElement {
             element_type: "mrkdwn".to_string(),
             text: format!(
-                "{}{} _{}_   <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}{}",
+                "{}{} _{}_   <{}#posted_by_bot|{}> | <{}#posted_by_bot|{}>   _*Assignee:*_ {}{}{}",
                 strikethrough,
                 status.0,
                 status.1,
+                project.web_url,
+                project.name,
                 merge_status.web_url,
                 merge_status.title,
                 merge_status.assignee.as_ref().unwrap().name,
